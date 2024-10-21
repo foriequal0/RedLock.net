@@ -1,0 +1,33 @@
+﻿name: CI
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+    branches:
+      - master
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+      - name: Before build
+        run: dotnet restore
+      - run: dotnet build
+      - name: After build
+        run: |
+          dotnet pack -c Release RedLockNet.SERedis\RedLockNet.SERedis.csproj /p:PackageOutputPath=.nupkgs
+      - name: Before test
+        run: |
+          $env:REDIS_PATH="$HOME/.nuget/packages/redis-64/3.0.503/tools"
+
+          cd RedLockNet.Tests\RedisConfig
+          Start-Process run-all-servers.cmd
+          Start-Sleep 5
+      - run: dotnet test
+      - uses: actions/upload-artifact@v4
+        with:
+          path: '${{ github.workspace }}\RedLockNet.SERedis\.nupkgs\*.nupkg'
