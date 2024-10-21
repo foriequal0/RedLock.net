@@ -31,6 +31,7 @@ namespace RedLockNet.SERedis
 		private bool isDisposed;
 
 		private Timer lockKeepaliveTimer;
+		private CancellationTokenSource lockKeepaliveCancellationTokenSource;
 
 		private static readonly string UnlockScript = EmbeddedResourceLoader.GetEmbeddedResource("RedLockNet.SERedis.Lua.Unlock.lua");
 
@@ -202,7 +203,7 @@ namespace RedLockNet.SERedis
 
 			if (IsAcquired)
 			{
-				StartAutoExtendTimer();
+				Task.Run(StartAutoExtendLoopAsync);
 			}
 		}
 
@@ -310,7 +311,22 @@ namespace RedLockNet.SERedis
 				(int) interval,
 				(int) interval);
 		}
-		
+
+		private async Task StartAutoExtendLoopAsync()
+		{
+			var interval = expiryTime.TotalMilliseconds / 2;
+
+			logger.LogDebug($"Starting auto extend timer with {interval}ms interval");
+
+			lockKeepaliveCancellationTokenSource = new CancellationTokenSource();
+			var cancellationToken = lockKeepaliveCancellationTokenSource.Token;
+			while (true)
+			{
+				await Task.Delay((int)interval, cancellationToken).ConfigureAwait(false);
+				await ExtendLockLifetimeAsync(cancellationToken).ConfigureAwait(false);
+			}
+		}
+
 		private void ExtendLockLifetime()
 		{
 			try
@@ -330,6 +346,66 @@ namespace RedLockNet.SERedis
 					var stopwatch = Stopwatch.StartNew();
 
 					var extendSummary = Extend();
+
+					var validityTicks = GetRemainingValidityTicks(stopwatch);
+
+					if (extendSummary.Acquired >= quorum && validityTicks > 0)
+					{
+						Status = RedLockStatus.Acquired;
+						InstanceSummary = extendSummary;
+						ExtendCount++;
+
+						logger.LogDebug($"Extended lock, {Status} ({InstanceSummary}): {Resource} ({LockId})");
+					}
+					else
+					{
+						Status = GetFailedRedLockStatus(extendSummary);
+						InstanceSummary = extendSummary;
+
+						logger.LogWarning($"Failed to extend lock, {Status} ({InstanceSummary}): {Resource} ({LockId})");
+					}
+				}
+				catch (Exception exception)
+				{
+					// All we can do here is log the exception and swallow it.
+					var message = $"Lock renewal timer thread failed: {Resource} ({LockId})";
+					logger.LogError(null, exception, message);
+				}
+				finally
+				{
+					if (gotSemaphore)
+					{
+						extendUnlockSemaphore.Release();
+					}
+				}
+			}
+			catch (OperationCanceledException)
+			{
+				// unlock has been called, don't extend
+				logger.LogDebug($"Lock renewal cancelled: {Resource} ({LockId})");
+			}
+		}
+
+		private async Task ExtendLockLifetimeAsync(CancellationToken cancellationToken)
+		{
+			try
+			{
+				var cancellationTokenSource = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, unlockCancellationTokenSource.Token);
+				var gotSemaphore = await extendUnlockSemaphore.WaitAsync(0, cancellationTokenSource.Token);
+				try
+				{
+					if (!gotSemaphore)
+					{
+						// another extend operation is still running, so skip this one
+						logger.LogWarning($"Lock renewal skipped due to another renewal still running: {Resource} ({LockId})");
+						return;
+					}
+
+					logger.LogTrace($"Lock renewal timer fired: {Resource} ({LockId})");
+
+					var stopwatch = Stopwatch.StartNew();
+
+					var extendSummary = await ExtendAsync();
 
 					var validityTicks = GetRemainingValidityTicks(stopwatch);
 
@@ -409,6 +485,25 @@ namespace RedLockNet.SERedis
 				extendResults.Add(ExtendInstance(cache));
 			});
 
+			return PopulateRedLockResult(extendResults);
+		}
+
+		private async Task<RedLockInstanceSummary> ExtendAsync()
+		{
+			var extendResults = new ConcurrentBag<RedLockInstanceResult>();
+
+			var tasks = new List<Task>();
+			foreach (var redisCache in redisCaches)
+			{
+				var task = Task.Run(async () =>
+				{
+					var result = await ExtendInstanceAsync(redisCache);
+					extendResults.Add(result);
+				});
+				tasks.Add(task);
+			}
+
+			await Task.WhenAll(tasks);
 			return PopulateRedLockResult(extendResults);
 		}
 
@@ -509,11 +604,44 @@ namespace RedLockNet.SERedis
 			try
 			{
 				logger.LogTrace($"ExtendInstance enter {host}: {redisKey}, {LockId}, {expiryTime}");
-				
+
 				// Returns 1 on success, 0 on failure setting expiry or key not existing, -1 if the key value didn't match
 				var extendResult = (long) cache.ConnectionMultiplexer
 					.GetDatabase(cache.RedisDatabase)
 					.ScriptEvaluate(ExtendIfMatchingValueScript, new RedisKey[] {redisKey}, new RedisValue[] {LockId, (long) expiryTime.TotalMilliseconds}, CommandFlags.DemandMaster);
+
+				result = extendResult == 1 ? RedLockInstanceResult.Success
+					: extendResult == -1 ? RedLockInstanceResult.Conflicted
+					: RedLockInstanceResult.Error;
+			}
+			catch (Exception ex)
+			{
+				logger.LogDebug($"Error extending lock instance {host}: {ex.Message}");
+
+				result = RedLockInstanceResult.Error;
+			}
+
+			logger.LogTrace($"ExtendInstance exit {host}: {redisKey}, {LockId}, {result}");
+
+			return result;
+		}
+
+		private async Task<RedLockInstanceResult> ExtendInstanceAsync(RedisConnection cache)
+		{
+			var redisKey = GetRedisKey(cache.RedisKeyFormat, Resource);
+			var host = GetHost(cache.ConnectionMultiplexer);
+
+			RedLockInstanceResult result;
+
+			try
+			{
+				logger.LogTrace($"ExtendInstance enter {host}: {redisKey}, {LockId}, {expiryTime}");
+				
+				// Returns 1 on success, 0 on failure setting expiry or key not existing, -1 if the key value didn't match
+				var extendResult = (long) await cache.ConnectionMultiplexer
+					.GetDatabase(cache.RedisDatabase)
+					.ScriptEvaluateAsync(ExtendIfMatchingValueScript, new RedisKey[] {redisKey}, new RedisValue[] {LockId, (long) expiryTime.TotalMilliseconds}, CommandFlags.DemandMaster)
+					.ConfigureAwait(false);
 
 				result = extendResult == 1 ? RedLockInstanceResult.Success
 					: extendResult == -1 ? RedLockInstanceResult.Conflicted
@@ -713,6 +841,13 @@ namespace RedLockNet.SERedis
 					lockKeepaliveTimer.Change(Timeout.Infinite, Timeout.Infinite);
 					lockKeepaliveTimer.Dispose();
 					lockKeepaliveTimer = null;
+				}
+
+				if (lockKeepaliveCancellationTokenSource != null)
+				{
+					lockKeepaliveCancellationTokenSource.Cancel();
+					lockKeepaliveCancellationTokenSource.Dispose();
+					lockKeepaliveCancellationTokenSource = null;
 				}
 			}
 		}
